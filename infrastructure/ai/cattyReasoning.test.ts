@@ -502,6 +502,33 @@ test('GPT-5.5 xhigh survives SDK serialization for Chat and Responses, including
   }
 });
 
+test('DeepSeek V4 and custom aliases serialize max through the installed Chat and Responses SDK', async () => {
+  const { createOpenAI } = await import('@ai-sdk/openai');
+  for (const api of ['chat', 'responses'] as const) {
+    for (const [providerId, model] of [['deepseek', 'deepseek-v4-flash'], ['custom', 'relay-model']] as const) {
+      for (const chip of ['max', undefined]) {
+        let body: Record<string, unknown> | undefined;
+        let fetchCalls = 0;
+        const openai = createOpenAI({ apiKey: 'test', fetch: async (_url, init) => {
+          fetchCalls += 1;
+          body = JSON.parse(String(init?.body));
+          throw new Error('captured max request');
+        } });
+        const provider = { providerId, openaiApi: api, advancedParams: { reasoningEffort: 'max' } };
+        const effort = resolveEffectiveCattyReasoningEffort(chip, provider.advancedParams.reasoningEffort);
+        const options = buildCattyReasoningProviderOptions(provider, effort, model);
+        await assert.rejects(async () => await openai[api](model).doGenerate({
+          prompt: [{ role: 'user', content: [{ type: 'text', text: 'hello' }] }],
+          providerOptions: options as SharedV4ProviderOptions,
+        }), /captured max request/);
+        assert.equal(fetchCalls, 1, `${api} ${model} ${chip ?? 'provider default'}`);
+        assert.ok(body);
+        assert.equal(api === 'chat' ? body.reasoning_effort : (body.reasoning as { effort?: string } | undefined)?.effort, 'max');
+      }
+    }
+  }
+});
+
 test('Anthropic adaptive thinking exposes max, and xhigh from 4.7 onward', () => {
   // 4.6 documents low|medium|high|max.
   assert.deepEqual(
