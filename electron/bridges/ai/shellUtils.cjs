@@ -226,46 +226,46 @@ function looksLikeIdleAutoLogout(outputTail) {
 
 // ── OSC 133 (shell-integration) readiness ──
 //
-// Shell-integration scripts emit FinalTerm markers at deterministic lifecycle
-// points, independent of prompt text, colors, or themes:
-//   `ESC]133;A` — prompt start (shell is accepting input)
-//   `ESC]133;B` — command start
-//   `ESC]133;C` — output start
-//   `ESC]133;D` — command finished
-// with a BEL (`\x07`) or ST (`\x1b\\`) terminator. The frontend already parses
-// these (createXTermRuntime registerOscHandler(133)); the electron-side
-// readiness path can reuse the same signal from the RAW prompt-tracking tail.
-//
-// State semantics (stored on `session.osc133Ready`):
-//   true  — last marker in the tail is `A`: the shell is at a prompt,
-//           accepting input. Overrides the text whitelist (the marker is
-//           emitted at the exact point the shell starts accepting input,
-//           regardless of how the prompt is themed).
-//   false — last marker is `C` or `D`: a command is in flight, or finished
-//           but no new prompt marker has arrived yet. Overrides text-ready:
-//           a whitelisted-looking last line at this point is exactly the case
-//           where text lies (a running program echoing prompt-shaped output,
-//           the false-ready risk #4048 was rejected for).
-//   null  — no markers in the tail: non-integrated shell, fall back to the
-//           existing whitelist behavior unchanged.
-//
-// Only markers within the 4KB rolling window are visible. Integration scripts
-// emit markers on every prompt cycle, so the most recent cycle is within the
-// window in practice.
-const OSC133_A_MARKER = "\u001B]133;A";
-const OSC133_C_MARKER = "\u001B]133;C";
-const OSC133_D_MARKER = "\u001B]133;D";
+// A starts a prompt; B ends its rendering and starts command input; C starts
+// execution/output; D finishes execution. A alone does not prove empty input.
+// Keep lifecycle state beyond rolling-tail eviction, and accept custom prompts
+// only while the B-marked cursor line is unchanged and no continuation arrived.
+// A-only integrations retain the existing whitelist checks.
+const OSC133_MARKER_PATTERN = /\u001B\]133;([ABCD])(?:;([^\u0007\u001B]*))?(?:\u0007|\u001B\\)/g;
 
-// lastIndexOf on the marker prefix matches both BEL- and ST-terminated
-// sequences (the terminator follows the opcode), and also accepts parameter
-// forms such as `133;D;0`.
+function isOsc133PrimaryPrompt(marker) {
+  // Kitty's k=s marks PS2, which is unfinished command input, not a fresh PS1.
+  return marker[1] === "A" && !marker[2]?.split(";").includes("k=s");
+}
+
 function computeOsc133ReadyState(tail) {
   if (typeof tail !== "string" || !tail) return null;
-  const lastA = tail.lastIndexOf(OSC133_A_MARKER);
-  const lastC = tail.lastIndexOf(OSC133_C_MARKER);
-  const lastD = tail.lastIndexOf(OSC133_D_MARKER);
-  if (lastA < 0 && lastC < 0 && lastD < 0) return null;
-  return lastA >= lastC && lastA >= lastD;
+  let ready = null;
+  for (const marker of tail.matchAll(OSC133_MARKER_PATTERN)) {
+    if (marker[1] !== "B") ready = isOsc133PrimaryPrompt(marker);
+  }
+  return ready;
+}
+
+function promptTrackingView(session) {
+  const tail = session?._promptTrackTail;
+  if (typeof tail !== "string" || !tail) return { tail: "", alternateScreenActive: false };
+  if (session.osc133Ready === true) {
+    const start = session._osc133PromptStart;
+    return {
+      // Never revive text from before A, or a prompt whose start was evicted.
+      tail: typeof start === "number" && start >= 0 ? tail.slice(start) : "",
+      alternateScreenActive: session._osc133PromptAltScreenAtStart === true,
+    };
+  }
+  return { tail, alternateScreenActive: session._promptTrackAltScreenAtTailStart === true };
+}
+
+function matchesOsc133EmptyPrompt(session, view) {
+  if (session._osc133PromptLine == null) return true;
+  if (session._osc133PromptContinued) return false;
+  const { terminalCursorLine } = require("../terminalLogSanitizer.cjs");
+  return terminalCursorLine(view.tail, view) === session._osc133PromptLine;
 }
 
 function trackSessionIdlePrompt(session, chunk) {
@@ -273,6 +273,42 @@ function trackSessionIdlePrompt(session, chunk) {
 
   const previousTail = session._promptTrackTail || "";
   const combined = `${previousTail}${chunk}`;
+  session.osc133Ready ??= null;
+  for (const marker of combined.matchAll(OSC133_MARKER_PATTERN)) {
+    const end = marker.index + marker[0].length;
+    // Replaying old markers would erase pending-input state on every chunk.
+    // A marker split across chunks is consumed when its terminator arrives.
+    if (end <= previousTail.length) continue;
+    if (isOsc133PrimaryPrompt(marker)) {
+      const { alternateScreenActiveAfter } = require("../terminalLogSanitizer.cjs");
+      session.osc133Ready = true;
+      session._osc133PromptStart = end;
+      session._osc133PromptAltScreenAtStart = alternateScreenActiveAfter(
+        combined.slice(0, end), session._promptTrackAltScreenAtTailStart === true,
+      );
+      session._osc133PromptLine = null;
+      session._osc133PromptEnd = -1;
+      session._osc133PromptContinued = false;
+    } else if (marker[1] === "B") {
+      if (session.osc133Ready === true && session._osc133PromptStart >= 0) {
+        const { terminalCursorLine } = require("../terminalLogSanitizer.cjs");
+        session._osc133PromptLine = terminalCursorLine(
+          combined.slice(session._osc133PromptStart, end),
+          { alternateScreenActive: session._osc133PromptAltScreenAtStart === true },
+        );
+        session._osc133PromptEnd = end;
+      }
+    } else {
+      session.osc133Ready = false;
+      session._osc133PromptLine = null;
+      session._osc133PromptStart = -1;
+      session._osc133PromptEnd = -1;
+    }
+  }
+  if (session._osc133PromptLine != null) {
+    const inputStart = Math.max(previousTail.length, session._osc133PromptEnd);
+    if (combined.slice(inputStart).includes("\n")) session._osc133PromptContinued = true;
+  }
   const overflow = combined.length - MAX_PROMPT_TRACK_TAIL;
   if (overflow > 0) {
     // The kept tail no longer starts where the previous tail started. Replay
@@ -283,12 +319,14 @@ function trackSessionIdlePrompt(session, chunk) {
       combined.slice(0, overflow),
       session._promptTrackAltScreenAtTailStart === true,
     );
+    for (const key of ["_osc133PromptStart", "_osc133PromptEnd"]) {
+      if (typeof session[key] === "number") session[key] = Math.max(-1, session[key] - overflow);
+    }
   }
   const nextTail = overflow > 0 ? combined.slice(overflow) : combined;
   session._promptTrackTail = nextTail;
-  session.osc133Ready = computeOsc133ReadyState(nextTail);
 
-  const prompt = extractTrailingIdlePrompt(nextTail);
+  const prompt = extractTrailingIdlePrompt(promptTrackingView(session).tail);
   if (prompt) {
     session.lastIdlePrompt = prompt;
     session.lastIdlePromptAt = Date.now();
@@ -315,24 +353,17 @@ function trackSessionIdlePrompt(session, chunk) {
 function getFreshIdlePrompt(session) {
   if (!session) return "";
 
-  // OSC 133 markers, when present, override the text whitelist: `C`/`D` as
-  // the last marker means the shell is not at a prompt even if the partial
-  // text looks like one, and `A` means it is accepting input regardless of
-  // how the prompt is themed. `null` (no markers) keeps the whitelist path.
+  // C/D gate text-shaped output. A never bypasses cache freshness or input
+  // checks: an earlier prompt remains marked A while a user edits a command.
   if (session.osc133Ready === false) return "";
 
   const cached = session.lastIdlePrompt;
   if (!cached) return "";
 
-  const tail = session._promptTrackTail;
+  const view = promptTrackingView(session);
+  const tail = view.tail;
   if (typeof tail !== "string" || !tail) return "";
-
-  if (session.osc133Ready === true) {
-    // A fresh `133;A` marker confirms the shell started a new prompt; bypass
-    // the endsWith expiry that exists to detect unrecognized output, since
-    // the marker — not the text — is the readiness proof here.
-    return cached;
-  }
+  if (!matchesOsc133EmptyPrompt(session, view)) return "";
 
   const normalizedTail = stripAnsi(tail).replace(/\r/g, "\n");
   const normalizedCached = stripAnsi(cached).replace(/\r/g, "\n");
@@ -348,21 +379,21 @@ function getFreshIdlePrompt(session) {
 // screen is still an idle default prompt (#3927). Collapse those cursor and
 // erase operations, then accept only the line the cursor is actually on.
 function getVisibleIdlePrompt(session) {
-  const tail = session?._promptTrackTail;
+  const view = promptTrackingView(session);
+  const tail = view.tail;
   if (typeof tail !== "string" || !tail) return "";
 
-  // Mirror getFreshIdlePrompt: markers override text; no markers → whitelist.
+  // Mirror getFreshIdlePrompt: C/D gate output, B confirms an empty input line.
   if (session.osc133Ready === false) return "";
+  if (!matchesOsc133EmptyPrompt(session, view)) return "";
 
   const { terminalCursorLine } = require("../terminalLogSanitizer.cjs");
-  const cursorLine = terminalCursorLine(tail, {
-    alternateScreenActive: session._promptTrackAltScreenAtTailStart === true,
-  });
+  const cursorLine = terminalCursorLine(tail, view);
   const rightTrimmed = cursorLine.replace(/\s+$/, "");
   if (!rightTrimmed) return "";
-  if (session.osc133Ready === true) {
-    // Marker-confirmed prompt start: accept the cursor line without the
-    // whitelist shape check (custom / colored prompts qualify too).
+  if (session.osc133Ready === true && session._osc133PromptLine != null) {
+    // A complete B gives the custom prompt boundary; its unchanged cursor line
+    // and lack of continuation are checked above before bypassing shape checks.
     return /\s$/.test(cursorLine) ? `${rightTrimmed} ` : rightTrimmed;
   }
   if (

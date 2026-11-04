@@ -1408,7 +1408,7 @@ test("trackSessionIdlePrompt stores OSC 133 state alongside the whitelist prompt
   assert.equal(getFreshIdlePrompt(plain), "user@host ~ % ");
 });
 
-test("OSC 133 A marker marks ready even for a colored P10k prompt and a fully unrecognized prompt", () => {
+test("OSC 133 keeps whitelisted prompts and readies custom prompts after B", () => {
   // Colored Powerlevel10k-style prompt: theme SGR codes + ❯, after an A marker.
   const p10k = {};
   trackSessionIdlePrompt(
@@ -1419,13 +1419,13 @@ test("OSC 133 A marker marks ready even for a colored P10k prompt and a fully un
   assert.equal(getFreshIdlePrompt(p10k), "~/src ❯ ");
   assert.equal(getVisibleIdlePrompt(p10k), "~/src ❯ ");
 
-  // A prompt shape the whitelist has never seen still becomes ready via the
-  // marker: getFreshIdlePrompt has no cached prompt, but the visible cursor
-  // line is accepted without the whitelist shape check.
+  // B marks the custom prompt boundary; A alone cannot prove empty input.
   const custom = {};
   trackSessionIdlePrompt(custom, "\x1b]133;A\x07myprompt λ ");
   assert.equal(custom.osc133Ready, true);
   assert.equal(getFreshIdlePrompt(custom), "");
+  assert.equal(getVisibleIdlePrompt(custom), "");
+  trackSessionIdlePrompt(custom, "\x1b]133;B\x07");
   assert.equal(getVisibleIdlePrompt(custom), "myprompt λ ");
 });
 
@@ -1464,14 +1464,13 @@ test("OSC 133 state survives markers split across PTY chunks via the rolling tai
   assert.equal(getVisibleIdlePrompt(session), "user@host ~ % ");
 });
 
-test("OSC 133 markers truncated out of the 4KB rolling window stop influencing readiness", () => {
+test("OSC 133 lifecycle state survives rolling-tail eviction without reviving old prompts", () => {
   const session = {};
   trackSessionIdlePrompt(session, "\x1b]133;A\x07");
   assert.equal(session.osc133Ready, true);
-  // 4200 bytes of marker-free output push the A marker off the window; only
-  // markers within the window count. Acceptable: integration scripts re-emit
-  // markers on every prompt cycle, so the latest cycle is in-window.
+  // Retain lifecycle state, but fail closed when the prompt itself was evicted.
   trackSessionIdlePrompt(session, "x".repeat(4200));
-  assert.equal(session.osc133Ready, null);
+  assert.equal(session.osc133Ready, true);
   assert.equal(getFreshIdlePrompt(session), "");
+  assert.equal(getVisibleIdlePrompt(session), "");
 });
